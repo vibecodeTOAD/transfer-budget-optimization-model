@@ -1,10 +1,32 @@
 import re
 import time
 import pandas as pd
-from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
-LEAGUE_PAYROLLS_URL = "https://www.capology.com/uk/premier-league/payrolls/"
+# ✅ PASTE ONLY THE CLUB SALARIES LINKS YOU WANT
+CLUB_SALARIES_URLS = [
+    "https://www.capology.com/club/ac-milan/salaries/",
+    "https://www.capology.com/club/atalanta/salaries/",
+    "https://www.capology.com/club/bologna/salaries/",
+    "https://www.capology.com/club/cagliari/salaries/",
+    "https://www.capology.com/club/como/salaries/",
+    "https://www.capology.com/club/cremonese/salaries/",
+    "https://www.capology.com/club/fiorentina/salaries/",
+    "https://www.capology.com/club/genoa/salaries/",
+    "https://www.capology.com/club/hellas-verona/salaries/",
+    "https://www.capology.com/club/inter-milan/salaries/",
+    "https://www.capology.com/club/juventus/salaries/",
+    "https://www.capology.com/club/lazio/salaries/",
+    "https://www.capology.com/club/lecce/salaries/",
+    "https://www.capology.com/club/napoli/salaries/",
+    "https://www.capology.com/club/parma/salaries/",
+    "https://www.capology.com/club/pisa/salaries/",
+    "https://www.capology.com/club/roma/salaries/",
+    "https://www.capology.com/club/sassuolo/salaries/",
+    "https://www.capology.com/club/torino/salaries/",
+    "https://www.capology.com/club/udinese/salaries/"
+    # add more...
+]
 
 WANTED_COLS = [
     "PLAYER",
@@ -19,40 +41,8 @@ WANTED_COLS = [
     "RELEASE CLAUSE (EUR)",
 ]
 
-def norm(s) -> str:
-    s = "" if s is None else str(s)
-    return re.sub(r"\s+", " ", s.strip()).upper()
-
-def club_links_from_league_page(page) -> list[str]:
-    # Grab club links only from the main payrolls table
-    # This avoids menu/footer duplicates.
-    hrefs = page.eval_on_selector_all(
-        "table a[href^='/club/']",
-        "els => els.map(e => e.getAttribute('href'))"
-    )
-
-    clubs = []
-    for h in hrefs:
-        if not h:
-            continue
-        full = urljoin("https://www.capology.com", h)
-
-        # normalize to base club URL: https://www.capology.com/club/<slug>
-        m = re.search(r"(https://www\.capology\.com/club/[^/]+)", full)
-        if m:
-            clubs.append(m.group(1))
-
-    # de-dupe in order
-    seen, out = set(), []
-    for u in clubs:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-
-    return out
-
-def to_salaries_url(club_base_url: str) -> str:
-    return club_base_url.rstrip("/") + "/salaries/"
+def norm(x) -> str:
+    return re.sub(r"\s+", " ", str(x or "").strip()).upper()
 
 def click_if_exists(page, text: str):
     loc = page.locator(f"button:has-text('{text}')")
@@ -60,44 +50,72 @@ def click_if_exists(page, text: str):
         loc.first.click()
         page.wait_for_timeout(800)
 
-def extract_contracts_table(page):
-    # Try to target the Contracts table specifically by finding the header "Contracts"
-    # then the next table on the page.
-    table = None
+def extract_best_contracts_table(page):
+    # Wait for any table rows to appear
+    page.wait_for_selector("table tbody tr", timeout=25000)
 
-    # If there are multiple tables, choose the one that contains "PLAYER" in header
     tables = page.locator("table")
+    best_table = None
+    best_score = -1
+
     for i in range(tables.count()):
         t = tables.nth(i)
-        headers = [norm(x) for x in t.locator("thead th").all_inner_texts()]
-        if any("PLAYER" == h or "PLAYER" in h for h in headers):
-            table = t
-            break
 
-    if table is None:
+        headers = t.locator("thead th").all_inner_texts()
+        headers_clean = [h.strip().lower() for h in headers if h.strip()]
+        row_count = t.locator("tbody tr").count()
+
+        if row_count == 0 or not headers_clean:
+            continue
+
+        joined = " ".join(headers_clean)
+
+        # score: look for contracts-like columns
+        score = 0
+        for kw in ["player", "gross", "p/w", "p/y", "expiration", "remaining", "release"]:
+            if kw in joined:
+                score += 1
+        score += min(row_count, 50) / 10
+
+        if score > best_score:
+            best_score = score
+            best_table = t
+
+    if best_table is None:
         return [], []
 
-    headers = [re.sub(r"\s+", " ", x).strip() for x in table.locator("thead th").all_inner_texts()]
-    rows = []
-    for tr in table.locator("tbody tr").all():
-        cells = [re.sub(r"\s+", " ", x).strip() for x in tr.locator("td").all_inner_texts()]
-        if cells:
-            rows.append(cells)
-    return headers, rows
+    # extract table via JS (gets rendered text)
+    data = best_table.evaluate("""
+    (tbl) => {
+      const clean = (s) => (s || "").replace(/\\s+/g, " ").trim();
+      const headers = Array.from(tbl.querySelectorAll("thead th")).map(th => clean(th.innerText));
+      const rows = Array.from(tbl.querySelectorAll("tbody tr")).map(tr =>
+        Array.from(tr.querySelectorAll("td")).map(td => clean(td.innerText))
+      );
+      return { headers, rows };
+    }
+    """)
+    return data["headers"], data["rows"]
 
-def pick_wanted_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Map actual columns -> wanted columns using keyword matching
-    actual = list(df.columns)
-    actual_norm = {c: norm(c) for c in actual}
+def pick_wanted_columns_by_index(rows: list[list[str]]) -> pd.DataFrame:
+    records = []
 
-    # helper to find best match by keywords
-    def find_col(*keywords):
-        kws = [k.upper() for k in keywords]
-        for c in actual:
-            s = actual_norm[c]
-            if all(k in s for k in kws):
-                return c
-        return None
+    for r in rows:
+        record = {
+            "PLAYER": r[0] if len(r) > 0 else "",
+            "BASE GROSS P/W (EUR)": r[2] if len(r) > 2 else "",
+            "BASE GROSS P/Y (EUR)": r[3] if len(r) > 3 else "",
+            "BONUS GROSS P/Y (EUR)": r[4] if len(r) > 4 else "",
+            "TOTAL GROSS P/Y (EUR)": r[5] if len(r) > 5 else "",
+            "SIGNED": r[6] if len(r) > 6 else "",
+            "EXPIRATION": r[7] if len(r) > 7 else "",
+            "YEARS REMAINING": r[8] if len(r) > 8 else "",
+            "GROSS REMAINING (EUR)": r[9] if len(r) > 9 else "",
+            "RELEASE CLAUSE (EUR)": ""
+        }
+        records.append(record)
+
+    return pd.DataFrame(records)
 
     col_map = {
         "PLAYER": find_col("PLAYER"),
@@ -112,15 +130,13 @@ def pick_wanted_columns(df: pd.DataFrame) -> pd.DataFrame:
         "RELEASE CLAUSE (EUR)": find_col("RELEASE", "CLAUSE"),
     }
 
-    keep = {new: old for new, old in col_map.items() if old is not None}
-    out = df[list(keep.values())].copy()
-    out.columns = list(keep.keys())
+    # build output with blanks for missing
+    out = pd.DataFrame()
+    for wanted in WANTED_COLS:
+        src = col_map.get(wanted)
+        out[wanted] = df[src] if src in df.columns else ""
 
-    for c in WANTED_COLS:
-        if c not in out.columns:
-            out[c] = ""
-
-    return out[WANTED_COLS]
+    return out
 
 def main():
     all_rows = []
@@ -129,54 +145,43 @@ def main():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        # 1) League page -> collect club base links
-        page.goto(LEAGUE_PAYROLLS_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
-
-        clubs = club_links_from_league_page(page)
-        if not clubs:
-            raise RuntimeError("Could not find any club links on payrolls page.")
-
-        # 2) Visit each club salaries page
-        for i, club_base in enumerate(clubs, start=1):
-            club_salaries = to_salaries_url(club_base)
-            print(f"[{i}/{len(clubs)}] {club_salaries}")
-
-            page.goto(club_salaries, wait_until="domcontentloaded")
+        for idx, url in enumerate(CLUB_SALARIES_URLS, start=1):
+            print(f"[{idx}/{len(CLUB_SALARIES_URLS)}] {url}")
+            page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
 
-           
+            # Force EUR + GROSS like your screenshot
             click_if_exists(page, "EUR")
             click_if_exists(page, "GROSS")
+            page.wait_for_timeout(2000)
 
-# give Capology time to recalc values
-            page.wait_for_timeout(1500)
+            headers, rows = extract_best_contracts_table(page)
 
-            headers, rows = extract_contracts_table(page)
-            print("Headers:", headers)
-            print("First row length:", len(rows[0]) if rows else 0)
+            if idx == 1:
+                print("DEBUG headers:", headers)
+                print("DEBUG first row:", rows[0] if rows else "NO ROWS")
+
             if not rows:
-                print("  -> No rows found (maybe paywalled or table not loaded).")
+                print("  -> No rows found (maybe paywalled or table didn’t load). Skipping.")
                 continue
 
-            df = pd.DataFrame(rows, columns=headers if headers and len(headers)==len(rows[0]) else None)
-            df.insert(0, "CLUB_SALARIES_URL", club_salaries)
+            # Make sure we always have usable headers
+            if not headers or len(headers) != len(rows[0]):
+                headers = [f"COL_{i}" for i in range(len(rows[0]))]
 
-            df2 = pick_wanted_columns(df)
-            df2.insert(0, "CLUB_SALARIES_URL", club_salaries)
-
+            df2 = pick_wanted_columns_by_index(rows)
+            df2.insert(0, "CLUB_SALARIES_URL", url)
             all_rows.append(df2)
-
-            time.sleep(1.2)
+            time.sleep(1.0)
 
         browser.close()
 
     if not all_rows:
-        raise RuntimeError("No data scraped. Likely paywall or table selectors need adjustment.")
+        raise RuntimeError("No data scraped from any pasted links.")
 
     final = pd.concat(all_rows, ignore_index=True)
-    final.to_excel("capology_PL_contracts_columns.xlsx", index=False)
-    print("Saved: capology_PL_contracts_columns.xlsx")
+    final.to_excel("capology_salaries_EUR.xlsx", index=False)
+    print("Saved: capology_salaries_EUR.xlsx")
 
 if __name__ == "__main__":
     main()
